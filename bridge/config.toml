@@ -1,0 +1,30 @@
+# remarkable-bridge configuration (TOML, stdlib tomllib — ADR-0001).
+
+[routes]
+# Tag names that route a document to an agent. Compared lowercased, exact
+# (contract: tablet-document). Stage 1 implements only "review".
+tags = ["review"]
+
+[tablet]
+# SSH host alias from ~/.ssh/config. On the dev server this points at the tablet's
+# LAN/tailnet IP over WiFi SSH, NOT the USB address (ADR-0005, .verity/deploy-access.md).
+ssh_host = "remarkable"
+xochitl = "/home/root/.local/share/remarkable/xochitl"
+# Create-only destination for published responses (contract: response-publish).
+responses_folder = "/Claude/Responses"
+
+[agent]
+# Optional model override passed to `claude -p --model` (empty = CLI default).
+model = ""
+# Per-run timeout in seconds (ADR-0004 default 10 min).
+timeout = 600
+
+[paths]
+state = "~/.local/state/remarkable-bridge/state.json"
+out = "out"
+logs = "logs"
+workspace = "workspace"
+
+[watcher]
+# Poll interval in seconds for the daemon loop (ADR-0005: ~60s).
+poll_interval = 60

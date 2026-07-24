@@ -1,0 +1,32 @@
+[project]
+name = "remarkable-bridge"
+version = "0.1.0"
+description = "Host-side daemon bridging a reMarkable tablet to the Claude Code CLI (review route)."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "markdown>=3.5",
+    "weasyprint>=60",
+    "reportlab>=4.0",
+    "rmscene>=0.6",
+    "pymupdf>=1.24",
+]
+
+[project.scripts]
+remarkable-bridge = "bridge.watcher:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
