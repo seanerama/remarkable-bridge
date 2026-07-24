@@ -24,4 +24,10 @@ Scaffolded by Verity. Nothing deployed yet.
 
 ## Coordination notes
 
-- (none)
+- 2026-07-24 — Architecture locked (`/verity:architect`). Stack: Python+uv, subprocess
+  SSH, rmscene/PyMuPDF, WeasyPrint (ADR-0001). Modular-monolith watcher; `remarkable-mcp`
+  is an external dep, not owned (ADR-0002/0003). Agents = headless `claude -p` behind an
+  injected runner (ADR-0004). Deploy target: **NSAF dev server / systemd**, tablet over
+  **WiFi SSH** (ADR-0005) — reachability is a first-deploy prerequisite. 4 frozen
+  contracts in `contracts/`. Walking skeleton: `docs/walking-skeleton.md`. helper-bot
+  feature declined (no web UI). Next: `/verity:plan`.
