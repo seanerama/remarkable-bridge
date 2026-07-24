@@ -172,7 +172,11 @@ def main() -> None:
                 print(f"published: {name}", flush=True)
             for err in report.errors:
                 print(f"error: {err}", flush=True)
-        except Exception as exc:  # tablet unreachable etc. — log, retry next cycle
+        except tablet.TabletUnreachable as exc:
+            # Transient transport failure: log, change no state, retry next cycle
+            # (ADR-0005, acceptance #4). Never crash, never reprocess.
+            print(f"tablet unreachable (will retry): {exc}", flush=True)
+        except Exception as exc:  # any other cycle error — log, retry next cycle
             print(f"cycle failed (will retry): {exc!r}", flush=True)
         time.sleep(config.poll_interval)
 

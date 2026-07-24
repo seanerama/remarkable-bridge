@@ -48,6 +48,14 @@ faked. It joins the hygiene gate; CI must be green.
 - **Prove dev-server → tablet WiFi SSH reachability** (ADR-0005 prerequisite) so the
   deploy step is real, not theoretical.
 
+> **Empirical gate CLOSED (Stage 2, 2026-07-24):** confirmed tag locations = top-level
+> `tags[]` + `pageTags[]` (flat, NOT nested under `cPages.pages[].tags[]`); dual
+> `formatVersion` 1 and 2 coexist on one device (fv2 = page objects under `cPages.pages[]`,
+> fv1 = flat array of page-id strings + `redirectionPageMap`); tag **element** shape pending
+> a tagged sample (both arrays empty on capture — no tagged docs exist yet). Reader
+> reconciled additively; frozen contract untouched. Full detail + real fixtures:
+> `docs/device-schema.md`, `tests/fixtures/real/`.
+
 ## Deploy (proves the target, ADR-0005)
 
 Install + enable the systemd unit on the NSAF dev server via a minimal `deploy.sh`

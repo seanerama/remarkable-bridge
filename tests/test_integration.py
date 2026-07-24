@@ -18,9 +18,12 @@ import json
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from bridge.clock import FixedClock
 from bridge.publish import RESPONSES_FOLDER, ReportLabRenderer
 from bridge.state import State
+from bridge.tablet import TabletUnreachable
 from bridge.watcher import Config, run_once
 
 from .fakes import FakeTabletClient, StubAgentRunner
@@ -94,3 +97,35 @@ def test_review_pipeline_end_to_end_and_dedup(tmp_path):
     assert report2.skipped_seen == [DOC_ID]
     assert len(client.uploads) == 1  # no new upload
     assert len(runner.calls) == 1  # agent not called again
+
+
+class _UnreachableClient(FakeTabletClient):
+    """A client whose scan fails the way an offline tablet does (SSH transport error)."""
+
+    def scan_raw(self):  # type: ignore[override]
+        raise TabletUnreachable("ssh to 'remarkable' failed: Connection refused")
+
+
+def test_unreachable_tablet_surfaces_typed_signal_without_state_mutation(tmp_path):
+    """Acceptance #4 (partial): unreachable tablet -> TabletUnreachable, no state written,
+    no reprocessing. The watcher's main loop catches this and retries next cycle."""
+    config = _config(tmp_path)
+    state = State.load(config.state_path)
+
+    with pytest.raises(TabletUnreachable):
+        run_once(
+            client=_UnreachableClient(raw_docs=[]),
+            runner=StubAgentRunner(),
+            clock=FixedClock(FIXED_DAY),
+            state=state,
+            config=config,
+            renderer=ReportLabRenderer(),
+        )
+
+    # No state mutation: nothing recorded in memory, nothing persisted to disk.
+    assert state.documents == {}
+    assert not config.state_path.exists()
+
+    # TabletUnreachable is an Exception, so watcher.main's guard degrades gracefully
+    # (log + retry next cycle) rather than crashing the daemon.
+    assert issubclass(TabletUnreachable, Exception)
