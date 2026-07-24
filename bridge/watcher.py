@@ -44,6 +44,19 @@ def _extract_handwriting_flag(extract_cfg: dict) -> bool:
     return flag
 
 
+def _execute_enabled_flag(execute_cfg: dict) -> bool:
+    """Resolve the dark-launch kill-switch for the whole execute route: ``[execute] enabled``
+    in config.toml, overridable at runtime by the ``EXECUTE_ENABLED`` env var. Default OFF.
+
+    With this OFF, an ``execute``-tagged doc is skipped entirely (not processed, no upload) —
+    behavior identical to before Stage 4. Mirrors ``EXTRACT_HANDWRITING`` (Stage 3)."""
+    flag = bool(execute_cfg.get("enabled", False))
+    env = os.environ.get("EXECUTE_ENABLED")
+    if env is not None:
+        flag = env.strip().lower() in _TRUTHY
+    return flag
+
+
 @dataclass
 class Config:
     route_tags: set[str]
@@ -59,6 +72,7 @@ class Config:
     agent_timeout: int
     poll_interval: int
     extract_handwriting: bool
+    execute_enabled: bool
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG) -> "Config":
@@ -69,6 +83,7 @@ class Config:
         paths = data.get("paths", {})
         watcher_cfg = data.get("watcher", {})
         extract_cfg = data.get("extract", {})
+        execute_cfg = data.get("execute", {})
 
         def _p(value: str) -> Path:
             return Path(value).expanduser()
@@ -87,6 +102,7 @@ class Config:
             agent_timeout=int(agent_cfg.get("timeout", 600)),
             poll_interval=int(watcher_cfg.get("poll_interval", 60)),
             extract_handwriting=_extract_handwriting_flag(extract_cfg),
+            execute_enabled=_execute_enabled_flag(execute_cfg),
         )
 
 
@@ -108,7 +124,8 @@ def run_once(
     config: Config,
     renderer: PdfRenderer | None = None,
 ) -> CycleReport:
-    """Run exactly one review-route poll cycle. Returns a summary of what happened."""
+    """Run exactly one poll cycle over the routed docs (review + execute). Returns a
+    summary of what happened."""
     report = CycleReport()
     raw_by_id = {raw.doc_id: raw for raw in client.scan_raw()}
 
@@ -117,8 +134,14 @@ def run_once(
         route = tablet.route_for(doc, config.route_tags)
         if route is None or doc.deleted or doc.type != "DocumentType":
             continue
-        # Stage 1 handles only the review route; other routes are later stages.
-        if route != "review":
+        # Handled routes: review (Stage 1) and execute (Stage 4). Anything else is a
+        # later stage and is skipped.
+        if route not in ("review", "execute"):
+            continue
+        # Dark-launch kill-switch: with EXECUTE_ENABLED OFF the execute route is skipped
+        # entirely — not processed, no upload — leaving review behavior byte-for-byte as
+        # before Stage 4.
+        if route == "execute" and not config.execute_enabled:
             continue
         if state.seen(doc):
             report.skipped_seen.append(doc.id)
@@ -134,7 +157,7 @@ def run_once(
                 route_tags=config.route_tags,
             )
             job = AgentJob(
-                route="review",
+                route=route,
                 doc=doc,
                 text=extracted.text,
                 workspace=workspace,
