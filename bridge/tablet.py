@@ -18,15 +18,28 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 # reMarkable on-device notebook root (ADR-0003).
 XOCHITL = "/home/root/.local/share/remarkable/xochitl"
+
+
+class TabletUnreachable(Exception):
+    """The tablet could not be reached over SSH (connect refused / timeout / no route).
+
+    Distinct from "reachable, nothing new". The watcher treats this as *transient*:
+    log it, change no state, retry next cycle (never crash, never reprocess) —
+    ADR-0005, spec acceptance test #4. It signals a *transport* failure, NOT a remote
+    command that merely exited nonzero (e.g. ``cat`` of a missing page), which stays a
+    plain :class:`subprocess.CalledProcessError` the readers handle locally.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -127,6 +140,83 @@ def read_tags(content: dict) -> list[str]:
     return ordered
 
 
+def page_ids(content: dict) -> list[str]:
+    """Enumerate a document's page ids, tolerating BOTH on-device format versions.
+
+    Verified on-device (2026-07-24, ``docs/device-schema.md``):
+
+    * ``formatVersion: 2`` → pages are **objects** under ``cPages.pages[]``, each with an
+      ``id`` (and ``template``/``idx``/...).
+    * ``formatVersion: 1`` → ``pages`` is a **flat top-level array of id strings** (plus a
+      sibling ``redirectionPageMap``); there is no ``cPages``.
+
+    Either shape yields the same ``[page_id, ...]``; unknown shapes yield ``[]`` rather
+    than raising, so a malformed/novel ``.content`` never crashes a scan.
+    """
+    def _ids_from(seq: object) -> list[str]:
+        out: list[str] = []
+        if not isinstance(seq, list):
+            return out
+        for entry in seq:
+            if isinstance(entry, str):
+                out.append(entry)
+            elif isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                out.append(entry["id"])
+        return out
+
+    cpages = content.get("cPages")
+    if isinstance(cpages, dict) and isinstance(cpages.get("pages"), list):
+        return _ids_from(cpages["pages"])  # formatVersion 2
+    return _ids_from(content.get("pages"))  # formatVersion 1 (flat string array)
+
+
+def _parse_cat_stream(out: bytes) -> dict[str, bytes]:
+    """Parse the ``\\x1e``-delimited batched-``cat`` stream into ``{rel_path: bytes}``.
+
+    The stream is ``\\x1e<rel>\\x1e<file-bytes>`` repeated per file (see
+    :meth:`SubprocessTabletClient._batch_cat`). Only text ``.metadata``/``.content`` JSON
+    flows through here, so the record separator can never collide with file content.
+    """
+    result: dict[str, bytes] = {}
+    parts = out.split(b"\x1e")
+    it = iter(parts[1:])  # parts[0] is the empty lead-in before the first separator
+    for rel_b, body in zip(it, it):
+        result[rel_b.decode("utf-8", "replace")] = body
+    return result
+
+
+def _parse_stat_lines(out: bytes, marker: int) -> tuple[set[str], int]:
+    """Parse ``<epoch> <path>`` lines into ``(changed_doc_ids, max_epoch_seen)``.
+
+    A doc id is "changed" when its ``.metadata`` or ``.content`` mtime is strictly newer
+    than ``marker``. ``max_epoch_seen`` becomes the next marker (see change detection in
+    :meth:`SubprocessTabletClient.scan_raw_changed`).
+    """
+    changed: set[str] = set()
+    max_epoch = marker
+    for line in out.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        epoch_s, _, path = line.partition(" ")
+        try:
+            epoch = int(epoch_s)
+        except ValueError:
+            continue
+        base = path.rsplit("/", 1)[-1]
+        if base.endswith(".metadata"):
+            doc_id = base[: -len(".metadata")]
+        elif base.endswith(".content"):
+            doc_id = base[: -len(".content")]
+        else:
+            continue
+        if epoch > marker:
+            changed.add(doc_id)
+        if epoch > max_epoch:
+            max_epoch = epoch
+    return changed, max_epoch
+
+
 def compute_content_hash(raw: RawDoc) -> str:
     """sha256 over the .content bytes + every page .rm bytes (dedup key).
 
@@ -162,7 +252,13 @@ def parse_doc(raw: RawDoc) -> TabletDoc:
 
 
 def scan(client: TabletClient) -> list[TabletDoc]:
-    """Scan the tablet and return normalized :class:`TabletDoc` records."""
+    """Scan the tablet and return normalized :class:`TabletDoc` records.
+
+    Reachability: if the client cannot reach the tablet it raises
+    :class:`TabletUnreachable`, which propagates here unchanged — callers distinguish
+    "unreachable" (retry next cycle, no state change) from "reachable, nothing new"
+    (an empty list). "Nothing new" is never an error.
+    """
     return [parse_doc(raw) for raw in client.scan_raw()]
 
 
@@ -190,49 +286,172 @@ class SubprocessTabletClient:
     No delete/overwrite method is defined — writes are create-only (ADR-0003).
     """
 
-    def __init__(self, host: str = "remarkable", xochitl: str = XOCHITL) -> None:
+    def __init__(
+        self,
+        host: str = "remarkable",
+        xochitl: str = XOCHITL,
+        *,
+        marker_path: Path | str | None = None,
+        connect_timeout: int = 15,
+        timeout: int = 120,
+    ) -> None:
         self.host = host
         self.xochitl = xochitl
+        # Change-detection marker: the max .metadata/.content mtime (epoch seconds) seen
+        # on the last scan. Persisted locally on the *watcher host* (never written to the
+        # tablet — the device stays strictly read-only bar create-only uploads, ADR-0003).
+        self._marker_path = Path(marker_path).expanduser() if marker_path else None
+        self._last_marker = self._load_marker()
+        self.connect_timeout = connect_timeout
+        self.timeout = timeout
 
+    # ---- SSH transport ------------------------------------------------------ #
     def _ssh(self, cmd: str) -> bytes:
-        return subprocess.run(
-            ["ssh", self.host, cmd], check=True, capture_output=True
-        ).stdout
+        """Run one remote command; raise :class:`TabletUnreachable` on TRANSPORT failure.
+
+        A transport failure (connect refused/timeout/no route — ssh's own exit 255, a
+        client timeout, or a missing ``ssh`` binary) is unreachability. A remote command
+        that merely exits nonzero (e.g. ``cat`` of a missing file) is NOT — it surfaces
+        as :class:`subprocess.CalledProcessError` for the caller to handle locally.
+        """
+        argv = [
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", f"ConnectTimeout={self.connect_timeout}",
+            self.host,
+            cmd,
+        ]
+        try:
+            proc = subprocess.run(argv, capture_output=True, timeout=self.timeout)
+        except FileNotFoundError as exc:  # ssh not installed on this host
+            raise TabletUnreachable(f"ssh unavailable: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise TabletUnreachable(f"ssh to {self.host!r} timed out after {self.timeout}s") from exc
+        if proc.returncode == 255:  # ssh's own "could not connect" exit code
+            stderr = proc.stderr.decode("utf-8", "replace").strip()
+            raise TabletUnreachable(f"ssh to {self.host!r} failed: {stderr}")
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, argv, proc.stdout, proc.stderr)
+        return proc.stdout
 
     def _read(self, remote_rel: str) -> bytes:
-        return self._ssh(f"cat {self.xochitl}/{remote_rel}")
+        return self._ssh(f"cat {shlex.quote(f'{self.xochitl}/{remote_rel}')}")
+
+    def _batch_cat(self, rels: list[str]) -> dict[str, bytes]:
+        """Read many files in ONE ssh round-trip (contract/ADR-0003: batched cat).
+
+        Emits ``\\x1e<rel>\\x1e<bytes>`` per file over a single connection; missing files
+        yield empty bytes (``|| true``) rather than aborting the batch. Used for the small
+        text ``.metadata``/``.content`` JSON only — binary page ``.rm`` bytes are read
+        individually (they could contain the separator).
+        """
+        if not rels:
+            return {}
+        parts = []
+        for rel in rels:
+            remote = shlex.quote(f"{self.xochitl}/{rel}")
+            parts.append(f"printf '\\036%s\\036' {shlex.quote(rel)}; cat {remote} 2>/dev/null || true")
+        return _parse_cat_stream(self._ssh("; ".join(parts)))
+
+    def _read_pages(self, doc_id: str, content: bytes) -> dict[str, bytes]:
+        """Pull a doc's page ``.rm`` bytes, driven by the parsed content (both formats)."""
+        try:
+            parsed = json.loads(content) if content else {}
+        except (ValueError, UnicodeDecodeError):
+            parsed = {}
+        pages: dict[str, bytes] = {}
+        for pid in page_ids(parsed):
+            try:
+                pages[pid] = self._read(f"{doc_id}/{pid}.rm")
+            except subprocess.CalledProcessError:
+                continue  # not every page has strokes (e.g. blank PDF pages)
+        return pages
+
+    def _read_docs(self, ids: list[str]) -> list[RawDoc]:
+        """Materialize :class:`RawDoc`s for ``ids``: one batched cat + per-doc page pulls."""
+        if not ids:
+            return []
+        rels = [f"{i}.metadata" for i in ids] + [f"{i}.content" for i in ids]
+        blobs = self._batch_cat(rels)
+        docs: list[RawDoc] = []
+        for doc_id in ids:
+            metadata = blobs.get(f"{doc_id}.metadata") or b""
+            if not metadata:
+                continue  # no metadata → not a real document dir
+            content = blobs.get(f"{doc_id}.content") or b"{}"
+            docs.append(
+                RawDoc(
+                    doc_id=doc_id,
+                    metadata=metadata,
+                    content=content,
+                    pages=self._read_pages(doc_id, content),
+                )
+            )
+        return docs
 
     def scan_raw(self) -> list[RawDoc]:
+        """Full scan of every document (unchanged contract; used by ``ensure_folder``).
+
+        Enumerates all ``.metadata`` via one ``find``, then a single batched ``cat`` for
+        every doc's metadata+content, then per-doc page bytes. Kept exhaustive on purpose
+        so ``ensure_folder`` always sees the whole collection tree; the poll loop should
+        prefer :meth:`scan_raw_changed`.
+        """
         listing = self._ssh(
-            f"ls -1 {self.xochitl} 2>/dev/null || true"
+            f"find {shlex.quote(self.xochitl)} -maxdepth 1 -name '*.metadata'"
         ).decode("utf-8", "replace")
         ids = sorted(
             {
-                line[: -len(".metadata")]
+                line.rsplit("/", 1)[-1][: -len(".metadata")]
                 for line in listing.splitlines()
-                if line.endswith(".metadata")
+                if line.strip().endswith(".metadata")
             }
         )
-        docs: list[RawDoc] = []
-        for doc_id in ids:
-            try:
-                metadata = self._read(f"{doc_id}.metadata")
-            except subprocess.CalledProcessError:
-                continue
-            try:
-                content = self._read(f"{doc_id}.content")
-            except subprocess.CalledProcessError:
-                content = b"{}"
-            pages: dict[str, bytes] = {}
-            page_listing = self._ssh(
-                f"ls -1 {self.xochitl}/{doc_id} 2>/dev/null || true"
-            ).decode("utf-8", "replace")
-            for line in page_listing.splitlines():
-                if line.endswith(".rm"):
-                    page_id = line[: -len(".rm")]
-                    pages[page_id] = self._read(f"{doc_id}/{line}")
-            docs.append(RawDoc(doc_id=doc_id, metadata=metadata, content=content, pages=pages))
+        return self._read_docs(ids)
+
+    def scan_raw_changed(self) -> list[RawDoc]:
+        """Incremental scan: return only docs changed since the last marker; advance it.
+
+        One ``find ... -exec stat`` lists ``(mtime, path)`` for every ``.metadata``/
+        ``.content`` in a single round-trip; docs whose mtime exceeds the stored marker are
+        pulled (metadata+content batched, then their pages). The marker advances to the max
+        mtime seen and is persisted, so the next cycle pulls nothing unless something moved.
+        First run (marker 0) pulls everything, exactly like :meth:`scan_raw`.
+
+        Tradeoff (spec §4): a metadata-only edit still triggers a page pull for that one
+        doc, because we recompute its ``content_hash`` before deciding — the downstream
+        ``(uuid, content_hash)`` dedup (contract ``bridge-state``) makes that a no-op, and
+        unchanged docs are never touched at all. It never pulls the *whole tree* of pages.
+
+        Reachability: an unreachable tablet raises :class:`TabletUnreachable` from ``_ssh``
+        *before* the marker is advanced, so a failed cycle leaves state untouched.
+        """
+        out = self._ssh(
+            f"find {shlex.quote(self.xochitl)} -maxdepth 1 "
+            r"\( -name '*.metadata' -o -name '*.content' \) "
+            r"-exec stat -c '%Y %n' {} \;"
+        )
+        changed, max_epoch = _parse_stat_lines(out, self._last_marker)
+        docs = self._read_docs(sorted(changed))
+        # Advance the marker only after a successful pull (no partial-progress on failure).
+        self._last_marker = max_epoch
+        self._save_marker(max_epoch)
         return docs
+
+    # ---- marker persistence (watcher host, never the tablet) ---------------- #
+    def _load_marker(self) -> int:
+        if self._marker_path and self._marker_path.exists():
+            try:
+                return int(self._marker_path.read_text(encoding="utf-8").strip() or "0")
+            except (ValueError, OSError):
+                return 0
+        return 0
+
+    def _save_marker(self, epoch: int) -> None:
+        if not self._marker_path:
+            return
+        self._marker_path.parent.mkdir(parents=True, exist_ok=True)
+        self._marker_path.write_text(str(int(epoch)), encoding="utf-8")
 
     def _put(self, data: bytes, remote_rel: str) -> None:
         """scp bytes to ``xochitl/<remote_rel>``. Create-only by construction — we only
