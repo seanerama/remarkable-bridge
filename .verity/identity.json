@@ -1,0 +1,8 @@
+{
+  "version": "1.0",
+  "name": "remarkable-bridge",
+  "slug": "remarkable-bridge",
+  "owner": "seanerama",
+  "image_prefix": "ghcr.io/seanerama/remarkable-bridge",
+  "locked_at": "2026-07-24T19:22:24.190Z"
+}
