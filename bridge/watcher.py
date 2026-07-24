@@ -13,6 +13,7 @@ so a failed upload retries next cycle rather than being lost.
 
 from __future__ import annotations
 
+import os
 import time
 import tomllib
 from dataclasses import dataclass, field
@@ -30,6 +31,19 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PACKAGE_DIR / "config.toml"
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _extract_handwriting_flag(extract_cfg: dict) -> bool:
+    """Resolve the dark-launch kill-switch: ``[extract] handwriting`` in config.toml,
+    overridable at runtime by the ``EXTRACT_HANDWRITING`` env var. Default OFF."""
+    flag = bool(extract_cfg.get("handwriting", False))
+    env = os.environ.get("EXTRACT_HANDWRITING")
+    if env is not None:
+        flag = env.strip().lower() in _TRUTHY
+    return flag
+
+
 @dataclass
 class Config:
     route_tags: set[str]
@@ -44,6 +58,7 @@ class Config:
     model: str | None
     agent_timeout: int
     poll_interval: int
+    extract_handwriting: bool
 
     @classmethod
     def load(cls, path: Path = DEFAULT_CONFIG) -> "Config":
@@ -53,6 +68,7 @@ class Config:
         agent_cfg = data.get("agent", {})
         paths = data.get("paths", {})
         watcher_cfg = data.get("watcher", {})
+        extract_cfg = data.get("extract", {})
 
         def _p(value: str) -> Path:
             return Path(value).expanduser()
@@ -70,6 +86,7 @@ class Config:
             model=agent_cfg.get("model") or None,
             agent_timeout=int(agent_cfg.get("timeout", 600)),
             poll_interval=int(watcher_cfg.get("poll_interval", 60)),
+            extract_handwriting=_extract_handwriting_flag(extract_cfg),
         )
 
 
@@ -108,9 +125,14 @@ def run_once(
             continue
 
         try:
-            extracted = extract(raw)
             workspace = config.workspace_root / doc.id
             workspace.mkdir(parents=True, exist_ok=True)
+            extracted = extract(
+                raw,
+                render_handwriting=config.extract_handwriting,
+                out_dir=workspace / "pages",
+                route_tags=config.route_tags,
+            )
             job = AgentJob(
                 route="review",
                 doc=doc,

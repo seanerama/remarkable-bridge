@@ -19,6 +19,13 @@ model = ""
 # Per-run timeout in seconds (ADR-0004 default 10 min).
 timeout = 600
 
+[extract]
+# Dark-launch kill-switch for the Stage 3 handwriting render path (Claude reads the
+# rendered stroke PNGs directly — no OCR). OFF => typed-text-only, byte-for-byte the
+# Stage 1/2 behavior. Flip to true to enable, or override at runtime with the
+# EXTRACT_HANDWRITING env var (1/true/yes/on). Default OFF.
+handwriting = false
+
 [paths]
 state = "~/.local/state/remarkable-bridge/state.json"
 out = "out"
