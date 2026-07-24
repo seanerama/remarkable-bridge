@@ -59,6 +59,11 @@ class AgentRunner(Protocol):
         ...
 
 
+def _images_dir(page_images: list[Path]) -> Path:
+    """The directory holding the rendered handwriting PNGs (their common parent)."""
+    return page_images[0].parent
+
+
 def build_argv(
     job: AgentJob,
     prompts_dir: Path,
@@ -79,9 +84,45 @@ def build_argv(
     # execute scopes filesystem access to its per-doc sandbox; review runs read-only.
     if job.route == "execute":
         argv += ["--add-dir", str(job.workspace)]
+    elif job.page_images:
+        # review with rendered handwriting: grant READ access to the images' dir so the
+        # read-only agent can open the page PNGs. This does NOT broaden review's tool
+        # allowlist (still Read/Grep/Glob) — --add-dir only scopes filesystem reach.
+        argv += ["--add-dir", str(_images_dir(job.page_images))]
     if model:
         argv += ["--model", model]
     return argv
+
+
+def build_prompt(job: AgentJob) -> str:
+    """Compose the ``claude -p`` input text for a job.
+
+    Typed text (if any) is passed through unchanged. When the doc has rendered handwriting
+    pages, we append a listing of the image paths (relative to the run cwd = workspace) and
+    an instruction to read them as the page content — this is how the handwriting actually
+    reaches the agent. With no page images this returns exactly ``job.text or ""`` (Stage
+    1/2 behavior, byte-for-byte).
+    """
+    text = job.text or ""
+    if not job.page_images:
+        return text
+
+    def _rel(p: Path) -> str:
+        try:
+            return str(p.relative_to(job.workspace))
+        except ValueError:
+            return str(p)
+
+    listing = "\n".join(f"- {_rel(p)}" for p in job.page_images)
+    block = (
+        "The tagged page(s) are HANDWRITTEN and have been rendered to the following image "
+        "file(s), in page order:\n"
+        f"{listing}\n\n"
+        "Read each image (with the Read tool) as the primary page content — it contains "
+        "the handwriting to review. Base your review on what the images show."
+    )
+    parts = [text.strip(), block] if text.strip() else [block]
+    return "\n\n".join(parts).strip()
 
 
 class ClaudeAgentRunner:
@@ -103,7 +144,7 @@ class ClaudeAgentRunner:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         raw_log_path = self.logs_dir / f"{job.doc.id}-{job.route}.log"
         argv = build_argv(job, self.prompts_dir, self.model)
-        prompt_text = job.text or ""
+        prompt_text = build_prompt(job)
 
         # Log the invocation (argv carries no secrets) + timing for observability.
         try:
