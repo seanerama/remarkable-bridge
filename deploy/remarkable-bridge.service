@@ -1,0 +1,18 @@
+[Unit]
+Description=remarkable-bridge watcher (tablet -> claude -> tablet, review route)
+Documentation=https://github.com/seanerama/remarkable-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# WorkingDirectory is the deployed checkout; deploy.sh sets this up.
+WorkingDirectory=%h/remarkable-bridge
+# `uv run` resolves the pinned venv from uv.lock and launches the daemon loop.
+ExecStart=/usr/bin/env uv run remarkable-bridge
+Restart=on-failure
+RestartSec=15
+# The daemon inherits the service user's authenticated `claude` CLI (ADR-0004/0005).
+
+[Install]
+WantedBy=default.target
