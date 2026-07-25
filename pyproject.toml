@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-remarkable-bridge = "bridge.watcher:main"
+remarkable-bridge = "bridge.cli:main"
 
 [dependency-groups]
 dev = [
