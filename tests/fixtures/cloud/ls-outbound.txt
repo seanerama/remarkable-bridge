@@ -1,0 +1,3 @@
+[f]	Learn the basics
+[d]	Archive
+[f]	Notebook

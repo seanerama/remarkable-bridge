@@ -1,0 +1,31 @@
+[Unit]
+# Stage 6: reMarkable /Outbound cloud watcher -> nightshift note-ingest (the INBOX half).
+# Runs on the NSAF box (same host as nightshift, so it can reach the loopback control API).
+Description=remarkable-bridge Outbound watcher (cloud /Outbound -> nightshift note-ingest)
+Documentation=https://github.com/seanerama/remarkable-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# WorkingDirectory is the deployed checkout (deploy.sh sets this up).
+WorkingDirectory=%h/remarkable-bridge
+# `uv run` resolves the pinned venv from uv.lock and launches the watcher loop.
+ExecStart=/usr/bin/env uv run python -m bridge.watch
+Restart=on-failure
+RestartSec=15
+# Optional: point at an env file to override RMAPI_BIN / NIGHTSHIFT_BIN / WATCH_ENABLED
+# without editing config.toml. Leading '-' => missing file is not an error.
+EnvironmentFile=-%h/.config/remarkable-bridge/watch.env
+# The watcher shells the host-configured `rmapi` (read-only ls/get; ~/.config/rmapi/rmapi.conf)
+# and the `nightshift` CLI (loopback control API). Both are injected seams in code.
+
+[Install]
+WantedBy=default.target
+
+# --- DARK-SAFE ---------------------------------------------------------------------------
+# Ships DARK. `[watch] enabled = false` (config.toml) keeps the loop inert even if this unit
+# is started, so installing it is harmless. To go live, first flip `[watch] enabled = true`
+# (or set WATCH_ENABLED=1 in the EnvironmentFile above), THEN:
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now remarkable-bridge-watch.service

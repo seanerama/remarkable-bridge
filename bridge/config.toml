@@ -44,3 +44,28 @@ workspace = "workspace"
 [watcher]
 # Poll interval in seconds for the daemon loop (ADR-0005: ~60s).
 poll_interval = 60
+
+[cloud]
+# reMarkable CLOUD watcher (Stage 6): the INBOX half. Polls the tablet's /Outbound folder
+# via the reMarkable cloud API (works off-network) and hands each new note to the
+# nightshift-assistant. Read-only transport — rmapi is only ever `ls`/`get` (no writes).
+folder = "/Outbound"
+# rmapi binary (ddvk fork), configured at ~/.config/rmapi/rmapi.conf on the host.
+# Overridable at runtime with the RMAPI_BIN env var.
+rmapi_bin = "rmapi"
+# The nightshift control-CLI on the box PATH; the watcher shells
+# `nightshift submit --type note-ingest --params <json>` (contract: note-submission).
+# Overridable at runtime with the NIGHTSHIFT_BIN env var.
+nightshift_bin = "nightshift"
+# Per-note staging dir: extracted handwriting PNGs (page-NN.png) land under <staging>/<note-id>/,
+# which becomes the submitted images_dir.
+staging_dir = "~/.local/share/remarkable-bridge/notes"
+# Poll interval in seconds for the watcher loop.
+poll_interval = 60
+
+[watch]
+# Dark kill-switch for the whole Outbound watcher (Stage 6). OFF => the daemon loop is inert
+# (returns immediately, never lists the cloud, never submits). Ships dark: install the
+# systemd user unit but only `systemctl --user enable --now` it after flipping this to true
+# (or set the WATCH_ENABLED env var to 1/true/yes/on). Default OFF.
+enabled = false
