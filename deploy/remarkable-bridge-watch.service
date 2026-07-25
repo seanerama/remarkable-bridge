@@ -10,6 +10,11 @@ Wants=network-online.target
 Type=simple
 # WorkingDirectory is the deployed checkout (deploy.sh sets this up).
 WorkingDirectory=%h/remarkable-bridge
+# systemd user services do NOT inherit the login shell PATH, so `uv` (typically in
+# ~/.local/bin) is not found by a bare `env uv` (exit 127). Put ~/.local/bin on PATH
+# so `uv` — and any host CLI the watcher shells (rmapi/nightshift, when not given as
+# absolute RMAPI_BIN/NIGHTSHIFT_BIN) — resolve.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # `uv run` resolves the pinned venv from uv.lock and launches the watcher loop.
 ExecStart=/usr/bin/env uv run python -m bridge.watch
 Restart=on-failure
